@@ -1,118 +1,154 @@
 import time
-from pathlib import Path
 
-import torch 
+import numpy as np
+import torch
 import onnxruntime as ort
+import pandas as pd
 from max import engine
-from torchvision.models import get_model
+
+from max_benchmark import models
 
 
-def load_torchscript(model_name):
-    model_name = "mobilenet_v3_large"
-    model_path = Path(__file__).parent / f"../../models/{model_name}.torchscript"
-    input_batch = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
-
-    if model_path.exists():
-        return input_batch, model_path
-
-    model = get_model(model_name, pretrained=True)
-    model.eval()
-
-    with torch.no_grad():
-        traced_model = torch.jit.trace(model, input_batch)
-
-    torch.jit.save(traced_model, model_path)
-
-    assert model_path.exists()
-    return input_batch, model_path
-
-
-def load_onnx(model_name):
-    model_path = Path(__file__).parent / f"../../models/{model_name}.onnx"
-    input_batch = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
-
-    if model_path.exists():
-        return input_batch, model_path
-
-    model = get_model(model_name, pretrained=True)
-    model.eval()
-
-    with torch.no_grad():
-        torch.onnx.export(model, input_batch, model_path, export_params=True, opset_version=11)
-
-    assert model_path.exists()
-    return input_batch, model_path
-
-
-def benchmark_max(model_name):
+def benchmark_max(model_path, input):
     print("Benchmarking MAX...")
-    print("Loading model...")
-    input_batch, model_path = load_torchscript(model_name)
-
     session = engine.InferenceSession()
-    model = session.load(model_path, input_specs=[engine.TorchInputSpec(shape=(1, 3, 224, 224), dtype=engine.DType.float32)])
+    model = session.load(model_path, input_specs=[engine.TorchInputSpec(shape=input.shape, dtype=engine.DType.float32)])
+    input_name = model.input_metadata[0].name
 
     print("Warming up...")
     for _ in range(10):
-        model.execute(x=input_batch)
+        model.execute(**{input_name: input})
 
     print("Benchmarking...")
-    start = time.time()
+    elapsed = 0
 
     for _ in range(100):
-        model.execute(x=input_batch)
+        inputs = {input_name: np.random.random(input.shape).astype(np.float32)}
 
-    end = time.time()
+        start = time.time()
+        model.execute(**inputs)
+        end = time.time()
 
-    print(f"Time taken: {end - start:.2f} seconds")
+        elapsed += end - start
+
+    print(f"Time taken: {elapsed:.2f} seconds")
+    return elapsed
 
 
-def benchmark_torchscript(model_name):
+def benchmark_torchscript(model_path, input):
     print("Benchmarking TorchScript...")
-    print("Loading model...")
-    input_batch, model_path = load_torchscript(model_name)
 
     model = torch.jit.load(model_path)
+    input = torch.tensor(input)
 
     print("Warming up...")
     for _ in range(10):
-        model(input_batch)
+        model(input)
 
     print("Benchmarking...")
-    start = time.time()
+    elapsed = 0
 
     for _ in range(100):
-        model(input_batch)
+        input = torch.tensor(np.random.random(input.shape).astype(np.float32))
 
-    end = time.time()
+        start = time.time()
+        model(input)
+        end = time.time()
 
-    print(f"Time taken: {end - start:.2f} seconds")
+        elapsed += end - start
+
+    print(f"Time taken: {elapsed:.2f} seconds")
+    return elapsed
 
 
-def benchmark_ort(model_name):
+def benchmark_ort(model_path, input):
     print("Benchmarking ONNX Runtime...")
     print("Loading model...")
-    input_batch, model_path = load_onnx(model_name)
-    ort_session = ort.InferenceSession(str(model_path), prividers=["CPUExecutionProvider"])
+    ort_session = ort.InferenceSession(model_path, prividers=["CPUExecutionProvider"])
 
     print("Warming up...")
     for _ in range(10):
-        ort_session.run(None, {"input.1": input_batch.numpy()})
+        ort_session.run(None, {"input": input})
 
     print("Benchmarking...")
-    start = time.time()
+
+    elapsed = 0
 
     for _ in range(100):
-        input_batch = torch.zeros((1, 3, 224, 224), dtype=torch.float32)
-        out = ort_session.run(None, {"input.1": input_batch.numpy()})
+        inputs = {"input": np.random.random(input.shape).astype(np.float32)}
 
-    end = time.time()
+        start = time.time()
+        ort_session.run(None, inputs)
+        end = time.time()
 
-    print(f"Time taken: {end - start:.2f} seconds")
+        elapsed += end - start
 
+    print(f"Time taken: {elapsed:.2f} seconds")
+    return elapsed
+
+
+def main():
+    model_names = [
+        ("ultralytics", "yolov8n-seg"),
+        # ("torchvision", "vit_l_16"),
+        ("timm", "tf_efficientnet_lite0"),
+        ("torchvision", "mobilenet_v2"),
+        ("torchvision", "mobilenet_v3_large"),
+        ("torchvision", "resnet50"),
+    ]
+
+    batch_sizes = [1]
+    # batch_sizes = [1, 128]
+
+    result = []
+
+    for (source, model_name) in model_names:
+        for batch_size in batch_sizes:
+            print(f"Benchmarking {model_name} with batch size {batch_size}...")
+            try:
+                if source == "torchvision":
+                    torch_model, input = models.torchvision.load_torchscript(model_name, batch_size)
+                elif source == "timm":
+                    torch_model, input = models.timm.load_torchscript(model_name, batch_size)
+                elif source == "ultralytics":
+                    torch_model, input = models.ultralytics.load_torchscript(model_name, batch_size)
+            
+                max_result = benchmark_max(torch_model, input)
+                torch_result = benchmark_torchscript(torch_model, input)
+            except Exception as e:
+                raise e
+                print("Exception occurred on torchscript model: ", model_name)
+                print(e)
+                max_result = float('nan')
+                torch_result = float('nan')
+
+            try:
+                if source == "torchvision":
+                    onnx_model, input = models.torchvision.load_onnx(model_name, batch_size)
+                elif source == "timm":
+                    onnx_model, input = models.timm.load_onnx(model_name, batch_size)
+                elif source == "ultralytics":
+                    onnx_model, input = models.ultralytics.load_onnx(model_name, batch_size)
+            
+                ort_result = benchmark_ort(onnx_model, input)
+                onnx_max_result = benchmark_max(onnx_model, input)
+            except Exception as e:
+                raise e
+                print("Exception occurred on onnx model: ", model_name)
+                print(e)
+                ort_result = float('nan')
+                onnx_max_result = float('nan')
+
+            result.append({
+                "model": model_name,
+                "batch_size": batch_size,
+                "max_torch": max_result,
+                "max_onnx": onnx_max_result,
+                "torch": torch_result,
+                "ort": ort_result,
+            })
+
+    pd.DataFrame(result).to_csv("benchmark.csv", index=False)
 
 if __name__ == "__main__":
-    model_name = "mobilenet_v3_large"
-    benchmark_max(model_name)
-    benchmark_torchscript(model_name)
-    benchmark_ort(model_name)
+    main()
